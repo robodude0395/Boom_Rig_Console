@@ -1,4 +1,4 @@
-import sys
+import sys 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QMenu, QCheckBox, QToolTip, QFileDialog, QInputDialog, QMessageBox
 )
@@ -16,11 +16,18 @@ class SplineEditor(QWidget):
         self.resize(900, 500)
 
         self.padding = 50
-        self.duration = 5.0  # seconds
+        self.duration = 5.0
         self.fps = 60
 
-        # Logical coordinates: (time in seconds, value)
-        self.points = [(0.0, 0.0), (1.0, 0.5), (3.0, -0.5), (5.0, 0.0)]
+        self.selected_handle = None  # (point_index, 'in' or 'out')
+
+        # Each point: (time, value, handle_out, handle_in)
+        self.points = [
+            (0.0, 0.0, None, None),
+            (1.0, 0.5, (1.5, 0.5), (0.5, 0.5)),
+            (3.0, -0.5, (3.5, -0.5), (2.7, -0.5)),
+            (5.0, 0.0, None, None),
+        ]
 
         self.value_min = -1.0
         self.value_max = 1.0
@@ -52,6 +59,29 @@ class SplineEditor(QWidget):
         self.setMouseTracking(True)
         self.history = []
 
+    def compute_handles(self, points, tension=0.3):
+        handles = []
+        n = len(points)
+        for i in range(n):
+            p0 = points[i-1][:2] if i > 0 else points[i][:2]
+            p1 = points[i][:2]
+            p2 = points[i+1][:2] if i < n-1 else points[i][:2]
+
+            dx_out = (p2[0] - p0[0]) * tension
+            dy_out = (p2[1] - p0[1]) * tension
+
+            handle_out = (p1[0] + dx_out / 3, p1[1] + dy_out / 3)
+            handle_in = (p1[0] - dx_out / 3, p1[1] - dy_out / 3)
+
+            handles.append((handle_out, handle_in))
+        return handles
+
+    def cubic_bezier(self, t, P0, P1, P2, P3):
+        return (
+            (1 - t)**3 * P0[0] + 3 * (1 - t)**2 * t * P1[0] + 3 * (1 - t) * t**2 * P2[0] + t**3 * P3[0],
+            (1 - t)**3 * P0[1] + 3 * (1 - t)**2 * t * P1[1] + 3 * (1 - t) * t**2 * P2[1] + t**3 * P3[1]
+        )
+
     def export_data(self):
         options = QFileDialog.Options()
         path, _ = QFileDialog.getSaveFileName(self, "Save Spline Data", "", "JSON Files (*.json);;All Files (*)", options=options)
@@ -76,12 +106,11 @@ class SplineEditor(QWidget):
             try:
                 with open(path, 'r') as f:
                     data = json.load(f)
-                # Validate & load
                 self.duration = data.get("x_max", self.duration)
                 self.value_min = data.get("y_min", self.value_min)
                 self.value_max = data.get("y_max", self.value_max)
                 pts = data.get("points", [])
-                if all(len(pt) == 2 for pt in pts):
+                if all(len(pt) >= 2 for pt in pts):
                     self.points = [tuple(pt) for pt in pts]
                 else:
                     raise ValueError("Points data corrupted or invalid")
@@ -90,7 +119,6 @@ class SplineEditor(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Import Failed", str(e))
 
-    
     def save_state(self):
         self.history.append(self.points.copy())
 
@@ -107,17 +135,14 @@ class SplineEditor(QWidget):
         self.set_button.setGeometry(230, self.height() - 40, 80, 30)
         self.add_checkbox.setGeometry(320, self.height() - 40, 120, 30)
         self.value_label.setGeometry(460, self.height() - 40, 300, 30)
+        self.export_button.setGeometry(600, self.height() - 40, 80, 30)
+        self.import_button.setGeometry(690, self.height() - 40, 80, 30)
 
         self.play_button.clicked.connect(self.play_animation)
         self.stop_button.clicked.connect(self.stop_animation)
         self.restart_button.clicked.connect(self.restart_animation)
         self.set_button.clicked.connect(self.enable_set_start)
         self.add_checkbox.stateChanged.connect(lambda state: setattr(self, 'add_mode', state == Qt.Checked))
-
-        self.export_button.setGeometry(600, self.height() - 40, 80, 30)
-        self.import_button.setGeometry(690, self.height() - 40, 80, 30)
-        self.export_button.setGeometry(600, self.height() - 40, 80, 30)
-        self.import_button.setGeometry(690, self.height() - 40, 80, 30)
 
     def resizeEvent(self, event):
         self.setup_ui()
@@ -150,7 +175,7 @@ class SplineEditor(QWidget):
     def update_value_label(self):
         if len(self.points) < 2:
             return
-        times, values = zip(*sorted(self.points))
+        times, values = zip(*[(pt[0], pt[1]) for pt in self.points])
         f = interp1d(times, values, kind='cubic', fill_value="extrapolate")
         current_value = float(f(self.playhead_time))
         self.value_label.setText(f"Value: {current_value:.2f} @ {self.playhead_time:.2f}s")
@@ -170,7 +195,6 @@ class SplineEditor(QWidget):
     def draw_grid(self, painter):
         painter.save()
         painter.setPen(QPen(QColor(230, 230, 255), 1))
-
         w, h = self.width(), self.height()
         for i in range(0, w, 50):
             painter.drawLine(i, 0, i, h)
@@ -180,21 +204,15 @@ class SplineEditor(QWidget):
 
     def draw_axes(self, painter):
         painter.setPen(QPen(Qt.black, 2))
-
-        # X and Y axes
         cx = self.padding
         cy = self.value_to_y(0)
         painter.drawLine(self.padding, self.padding, self.padding, self.height() - self.padding)
         painter.drawLine(self.padding, int(cy), self.width() - self.padding, int(cy))
-
-        # X ticks (time)
         for i in range(6):
             t = i * self.duration / 5
             x = self.time_to_x(t)
             painter.drawLine(int(x), int(cy) - 5, int(x), int(cy) + 5)
             painter.drawText(int(x) - 10, int(cy) + 20, f"{t:.1f}s")
-
-        # Y ticks (value)
         for j in range(5):
             v = self.value_max - j * (self.value_max - self.value_min) / 4
             y = self.value_to_y(v)
@@ -203,45 +221,61 @@ class SplineEditor(QWidget):
 
     def draw_points(self, painter):
         painter.setPen(QPen(Qt.red, 5))
-        for t, v in self.points:
+        radius = 4
+
+        for t, v, handle_out, handle_in in self.points:
             x = self.time_to_x(t)
             y = self.value_to_y(v)
             painter.drawPoint(int(x), int(y))
+            painter.drawEllipse(int(x - radius), int(y - radius), 2 * radius, 2 * radius)
+
+            # Draw handle_out line and point
+            if handle_out:
+                hx = self.time_to_x(handle_out[0])
+                hy = self.value_to_y(handle_out[1])
+                painter.setPen(QPen(Qt.darkGray, 1))
+                painter.drawLine(int(x), int(y), int(hx), int(hy))
+                painter.setPen(QPen(Qt.darkBlue, 2))
+                painter.drawEllipse(int(hx - radius), int(hy - radius), 2 * radius, 2 * radius)
+
+            # Draw handle_in line and point
+            if handle_in:
+                hx = self.time_to_x(handle_in[0])
+                hy = self.value_to_y(handle_in[1])
+                painter.setPen(QPen(Qt.darkGray, 1))
+                painter.drawLine(int(x), int(y), int(hx), int(hy))
+                painter.setPen(QPen(Qt.darkGreen, 2))
+                painter.drawEllipse(int(hx - radius), int(hy - radius), 2 * radius, 2 * radius)
+
 
     def draw_spline(self, painter):
         if len(self.points) < 2:
             return
-        self.points.sort()
-        times, values = zip(*self.points)
-
-        # Ensure times are strictly increasing by adding a tiny offset if needed
-        for i in range(1, len(times)):
-            if times[i] <= times[i - 1]:
-                times = list(times)
-                times[i] = times[i - 1] + 1e-5
-                times = tuple(times)
-
-        kind = 'cubic' if len(self.points) >= 4 else 'linear'
-        try:
-            f = interp1d(times, values, kind=kind, fill_value="extrapolate")
-        except Exception as e:
-            # fallback to linear if anything goes wrong
-            f = interp1d(times, values, kind='linear', fill_value="extrapolate")
 
         painter.setPen(QPen(Qt.blue, 2))
-        last_valid = False
-        for px in range(self.padding, self.width() - self.padding):
-            t = self.x_to_time(px)
-            v = float(f(t))
-            py = self.value_to_y(v)
-            if self.padding <= py <= self.height() - self.padding:
-                if last_valid:
-                    painter.drawLine(prev_px, prev_py, px, int(py))
-                prev_px = px
-                prev_py = int(py)
-                last_valid = True
-            else:
-                last_valid = False
+
+        for i in range(len(self.points) - 1):
+            P0 = self.points[i]
+            P1 = self.points[i + 1]
+
+            # Use actual stored handles
+            p0 = (self.time_to_x(P0[0]), self.value_to_y(P0[1]))
+            p3 = (self.time_to_x(P1[0]), self.value_to_y(P1[1]))
+
+            # Use stored handle_out from P0 and handle_in from P1
+            handle_out = P0[2] if P0[2] else P0[:2]
+            handle_in = P1[3] if P1[3] else P1[:2]
+
+            p1 = (self.time_to_x(handle_out[0]), self.value_to_y(handle_out[1]))
+            p2 = (self.time_to_x(handle_in[0]), self.value_to_y(handle_in[1]))
+
+            prev_point = p0
+            steps = 30
+            for step in range(1, steps + 1):
+                t = step / steps
+                x, y = self.cubic_bezier(t, p0, p1, p2, p3)
+                painter.drawLine(int(prev_point[0]), int(prev_point[1]), int(x), int(y))
+                prev_point = (x, y)
 
 
     def draw_playhead(self, painter):
@@ -251,7 +285,6 @@ class SplineEditor(QWidget):
         painter.setPen(QPen(Qt.green, 2))
         painter.drawLine(int(x), self.padding, int(x), self.height() - self.padding)
 
-    # ---------- Coordinate Transformations ----------
     def time_to_x(self, t):
         return self.padding + (t / self.duration) * (self.width() - 2 * self.padding)
 
@@ -263,12 +296,10 @@ class SplineEditor(QWidget):
 
     def y_to_value(self, y):
         return self.value_max - ((y - self.padding) / (self.height() - 2 * self.padding)) * (self.value_max - self.value_min)
-    
+
     def set_y_limit(self, which):
         current_val = self.value_min if which == 'min' else self.value_max
-        val, ok = QInputDialog.getDouble(self, f"Set Y {which.upper()}", 
-                                        f"Enter new Y {which} value:", 
-                                        current_val, -10000, 10000, 2)
+        val, ok = QInputDialog.getDouble(self, f"Set Y {which.upper()}", f"Enter new Y {which} value:", current_val, -10000, 10000, 2)
         if ok:
             if which == 'min':
                 if val >= self.value_max:
@@ -284,26 +315,19 @@ class SplineEditor(QWidget):
 
     def set_x_limit(self):
         current_val = self.duration
-        val, ok = QInputDialog.getDouble(self, "Set X Max",
-                                        "Enter new X max (seconds):",
-                                        current_val, 0.1, 10000, 2)
+        val, ok = QInputDialog.getDouble(self, "Set X Max", "Enter new X max (seconds):", current_val, 0.1, 10000, 2)
         if ok:
             if val <= 0:
                 QMessageBox.warning(self, "Invalid Value", "X max must be positive and greater than 0.")
                 return
             self.duration = val
-            # Also adjust points to fit new duration max if needed
-            self.points = [(min(t, self.duration), v) for (t, v) in self.points]
+            self.points = [(min(t, self.duration), v) + tuple(pt[2:]) for pt in self.points]
             self.update()
 
-
-    # ---------- Interaction ----------
     def mousePressEvent(self, event):
         x, y = event.x(), event.y()
-        # Detect right click near Y axis labels (left padding area)
         if event.button() == Qt.RightButton:
             if x < self.padding:
-                # Near Y axis labels
                 menu = QMenu(self)
                 set_ymin = menu.addAction("Set Y Min")
                 set_ymax = menu.addAction("Set Y Max")
@@ -316,63 +340,89 @@ class SplineEditor(QWidget):
                 elif action == set_xmax:
                     self.set_x_limit()
                 return
-
-        x, y = event.x(), event.y()
         t, v = self.x_to_time(x), self.y_to_value(y)
-
         if self.set_start_mode:
             self.playhead_time = max(0.0, min(self.duration, t))
             self.frame = int((self.playhead_time / self.duration) * self.fps * self.duration)
             self.set_start_mode = False
             self.update()
             return
-        
         if self.add_mode:
-                self.save_state()
-                self.points.append((t, v))
-                self.update()
-
-        if event.button() == Qt.RightButton:
-            for i, (pt, pv) in enumerate(self.points):
-                px, py = self.time_to_x(pt), self.value_to_y(pv)
+            self.save_state()
+            self.points.append((t, v, None, None))
+            self.update()
+        elif event.button() == Qt.LeftButton:
+            for i, pt in enumerate(self.points):
+                px, py = self.time_to_x(pt[0]), self.value_to_y(pt[1])
+                if abs(px - x) < 8 and abs(py - y) < 8:
+                    self.selected_point = i
+                    return
+        elif event.button() == Qt.RightButton:
+            for i, pt in enumerate(self.points):
+                px, py = self.time_to_x(pt[0]), self.value_to_y(pt[1])
                 if abs(px - x) < 8 and abs(py - y) < 8:
                     menu = QMenu(self)
                     action = menu.addAction("Delete Point")
                     action.triggered.connect(lambda _, idx=i: self.delete_point(idx))
                     menu.exec_(event.globalPos())
                     return
-
-        elif event.button() == Qt.LeftButton:
-            for i, (pt, pv) in enumerate(self.points):
-                px, py = self.time_to_x(pt), self.value_to_y(pv)
-                if abs(px - x) < 8 and abs(py - y) < 8:
-                    self.selected_point = i
+        
+        # After detecting control points...
+        for i, (t, v, handle_out, handle_in) in enumerate(self.points):
+            cx, cy = self.time_to_x(t), self.value_to_y(v)
+            if handle_out:
+                hx, hy = self.time_to_x(handle_out[0]), self.value_to_y(handle_out[1])
+                if abs(hx - x) < 8 and abs(hy - y) < 8:
+                    self.selected_handle = (i, 'out')
+                    return
+            if handle_in:
+                hx, hy = self.time_to_x(handle_in[0]), self.value_to_y(handle_in[1])
+                if abs(hx - x) < 8 and abs(hy - y) < 8:
+                    self.selected_handle = (i, 'in')
                     return
 
-            if self.add_mode:
-                self.points.append((t, v))
-                self.update()
 
     def mouseMoveEvent(self, event):
         x, y = event.x(), event.y()
         t, v = self.x_to_time(x), self.y_to_value(y)
         self.hovered_point = None
 
-        for pt, pv in self.points:
-            px, py = self.time_to_x(pt), self.value_to_y(pv)
+        # Check hover over main control points
+        for pt in self.points:
+            px, py = self.time_to_x(pt[0]), self.value_to_y(pt[1])
             if abs(px - x) < 8 and abs(py - y) < 8:
-                self.hovered_point = (pt, pv)
+                self.hovered_point = (pt[0], pt[1])
+                break
 
+        # Move main point
         if self.selected_point is not None:
             t = max(0.0, min(self.duration, t))
             v = max(self.value_min, min(self.value_max, v))
-            self.points[self.selected_point] = (t, v)
+            h_out, h_in = self.points[self.selected_point][2:]
+            self.points[self.selected_point] = (t, v, h_out, h_in)
             self.hovered_point = (t, v)
+
+        # Move Bézier handle
+        if self.selected_handle:
+            i, direction = self.selected_handle
+            t = max(0.0, min(self.duration, t))
+            v = max(self.value_min, min(self.value_max, v))
+            pt = self.points[i]
+            h_out, h_in = pt[2], pt[3]
+            if direction == 'out':
+                h_out = (t, v)
+            else:
+                h_in = (t, v)
+            self.points[i] = (pt[0], pt[1], h_out, h_in)
 
         self.update()
 
+
     def mouseReleaseEvent(self, event):
         self.selected_point = None
+        self.selected_point = None
+        self.selected_handle = None
+
 
     def delete_point(self, index):
         if 0 <= index < len(self.points):
