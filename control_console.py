@@ -22,11 +22,18 @@ class SplineEditor(QWidget):
         self.selected_handle = None  # (point_index, 'in' or 'out')
 
         # Each point: (time, value, handle_out, handle_in)
+        # Only time and value to start with:
         self.points = [
-            (0.0, 0.0, None, None),
-            (1.0, 0.5, (1.5, 0.5), (0.5, 0.5)),
-            (3.0, -0.5, (3.5, -0.5), (2.7, -0.5)),
-            (5.0, 0.0, None, None),
+            (0.0, 0.0),
+            (1.0, 0.5),
+            (3.0, -0.5),
+            (5.0, 0.0),
+        ]
+
+        # Compute handles and update points with handles
+        handles = self.compute_handles([(pt[0], pt[1]) for pt in self.points])
+        self.points = [
+            (pt[0], pt[1], handles[i][0], handles[i][1]) for i, pt in enumerate(self.points)
         ]
 
         self.value_min = -1.0
@@ -135,8 +142,8 @@ class SplineEditor(QWidget):
         self.set_button.setGeometry(230, self.height() - 40, 80, 30)
         self.add_checkbox.setGeometry(320, self.height() - 40, 120, 30)
         self.value_label.setGeometry(460, self.height() - 40, 300, 30)
-        self.export_button.setGeometry(600, self.height() - 40, 80, 30)
-        self.import_button.setGeometry(690, self.height() - 40, 80, 30)
+        self.export_button.setGeometry(650, self.height() - 40, 80, 30)
+        self.import_button.setGeometry(740, self.height() - 40, 80, 30)
 
         self.play_button.clicked.connect(self.play_animation)
         self.stop_button.clicked.connect(self.stop_animation)
@@ -175,9 +182,7 @@ class SplineEditor(QWidget):
     def update_value_label(self):
         if len(self.points) < 2:
             return
-        times, values = zip(*[(pt[0], pt[1]) for pt in self.points])
-        f = interp1d(times, values, kind='cubic', fill_value="extrapolate")
-        current_value = float(f(self.playhead_time))
+        current_value = self.evaluate_spline_value_at_time(self.playhead_time, self.points)
         self.value_label.setText(f"Value: {current_value:.2f} @ {self.playhead_time:.2f}s")
 
     def paintEvent(self, event):
@@ -251,6 +256,35 @@ class SplineEditor(QWidget):
     def draw_spline(self, painter):
         if len(self.points) < 2:
             return
+
+        painter.setPen(QPen(Qt.blue, 2))
+
+        for i in range(len(self.points) - 1):
+            P0 = self.points[i]
+            P1 = self.points[i + 1]
+
+            # Fallback handles using compute_handles if needed
+            if not P0[2] or not P1[3]:
+                fallback_handles = self.compute_handles([P0, P1])
+                handle_out = P0[2] if P0[2] else fallback_handles[0][0]
+                handle_in = P1[3] if P1[3] else fallback_handles[1][1]
+            else:
+                handle_out = P0[2]
+                handle_in = P1[3]
+
+            p0 = (self.time_to_x(P0[0]), self.value_to_y(P0[1]))
+            p3 = (self.time_to_x(P1[0]), self.value_to_y(P1[1]))
+            p1 = (self.time_to_x(handle_out[0]), self.value_to_y(handle_out[1]))
+            p2 = (self.time_to_x(handle_in[0]), self.value_to_y(handle_in[1]))
+
+            prev_point = p0
+            steps = 30
+            for step in range(1, steps + 1):
+                t = step / steps
+                x, y = self.cubic_bezier(t, p0, p1, p2, p3)
+                painter.drawLine(int(prev_point[0]), int(prev_point[1]), int(x), int(y))
+                prev_point = (x, y)
+
 
         painter.setPen(QPen(Qt.blue, 2))
 
@@ -347,10 +381,24 @@ class SplineEditor(QWidget):
             self.set_start_mode = False
             self.update()
             return
+        
         if self.add_mode:
             self.save_state()
             self.points.append((t, v, None, None))
+            self.points.sort(key=lambda pt: pt[0])  # Ensure time order
+
+            # Only compute handles if both in/out handles are None
+            updated_points = []
+            handles = self.compute_handles(self.points)
+            for i, pt in enumerate(self.points):
+                if pt[2] is None and pt[3] is None:
+                    updated_points.append((pt[0], pt[1], handles[i][0], handles[i][1]))
+                else:
+                    updated_points.append(pt)
+            self.points = updated_points
+
             self.update()
+
         elif event.button() == Qt.LeftButton:
             for i, pt in enumerate(self.points):
                 px, py = self.time_to_x(pt[0]), self.value_to_y(pt[1])
@@ -428,6 +476,48 @@ class SplineEditor(QWidget):
         if 0 <= index < len(self.points):
             del self.points[index]
             self.update()
+
+    def bezier_x(self, t, P0, P1, P2, P3):
+        return (1 - t)**3 * P0[0] + 3 * (1 - t)**2 * t * P1[0] + 3 * (1 - t) * t**2 * P2[0] + t**3 * P3[0]
+
+    def bezier_y(self, t, P0, P1, P2, P3):
+        return (1 - t)**3 * P0[1] + 3 * (1 - t)**2 * t * P1[1] + 3 * (1 - t) * t**2 * P2[1] + t**3 * P3[1]
+
+    def find_t_for_x(self, x_target, P0, P1, P2, P3, epsilon=1e-5):
+        # Binary search for t in [0,1] so that bezier_x(t) ~ x_target
+        low, high = 0.0, 1.0
+        while low < high:
+            mid = (low + high) / 2
+            x_val = self.bezier_x(mid, P0, P1, P2, P3)
+            if abs(x_val - x_target) < epsilon:
+                return mid
+            if x_val < x_target:
+                low = mid
+            else:
+                high = mid
+            if high - low < epsilon:
+                return (low + high) / 2
+        return 0.0
+
+    def evaluate_spline_value_at_time(self, t, points):
+        # Find segment containing t
+        for i in range(len(points) - 1):
+            if points[i][0] <= t <= points[i + 1][0]:
+                P0 = (points[i][0], points[i][1])
+                P1 = points[i][2]
+                P2 = points[i + 1][3]
+                P3 = (points[i + 1][0], points[i + 1][1])
+                break
+        else:
+            # t out of range, clamp
+            if t < points[0][0]:
+                return points[0][1]
+            else:
+                return points[-1][1]
+
+        local_t = self.find_t_for_x(t, P0, P1, P2, P3)
+        return self.bezier_y(local_t, P0, P1, P2, P3)
+
 
 
 if __name__ == '__main__':
